@@ -14,9 +14,18 @@ class LLMService:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=4),
-        retry=retry_if_exception_type(httpx.HTTPStatusError),
+        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)),
         reraise=True
     )
+    async def _send_groq_request(
+        self, client: httpx.AsyncClient, headers: dict, payload: dict
+    ) -> httpx.Response:
+        """Executes the upstream LLM request with retry on transient network/HTTP errors."""
+        request = client.build_request("POST", self.groq_url, headers=headers, json=payload)
+        response = await client.send(request, stream=True)
+        response.raise_for_status()
+        return response
+
     async def _stream_groq(
         self, prompt: str, model: str, temperature: float, system_prompt: str | None
     ) -> AsyncGenerator[str, None]:
@@ -37,8 +46,8 @@ class LLMService:
         }
 
         async with httpx.AsyncClient(timeout=45.0) as client:
-            async with client.stream("POST", self.groq_url, headers=headers, json=payload) as response:
-                response.raise_for_status()
+            response = await self._send_groq_request(client, headers, payload)
+            try:
                 async for line in response.aiter_lines():
                     if not line or line.startswith(":"):
                         continue
@@ -53,6 +62,8 @@ class LLMService:
                                 yield delta
                         except json.JSONDecodeError:
                             continue
+            finally:
+                await response.aclose()
 
     async def _stream_simulation(self, prompt: str) -> AsyncGenerator[str, None]:
         """Built-in high-performance mock simulator when no API key is configured."""

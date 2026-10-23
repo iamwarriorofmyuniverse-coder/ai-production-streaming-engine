@@ -63,16 +63,22 @@ class CacheService:
         }
 
     async def is_rate_limited(self, client_ip: str) -> bool:
-        """Sliding window / counter rate limiter per IP."""
+        """Atomic sliding window / counter rate limiter per IP using Lua script."""
         key = f"rate_limit:{client_ip}"
         if self._redis:
             try:
-                current = await self._redis.incr(key)
-                if current == 1:
-                    await self._redis.expire(key, 60)
-                return current > settings.RATE_LIMIT_PER_MINUTE
-            except Exception:
-                pass
+                # Atomic INCR and EXPIRE in a single Lua execution
+                lua_script = """
+                local current = redis.call('INCR', KEYS[1])
+                if current == 1 then
+                    redis.call('EXPIRE', KEYS[1], ARGV[1])
+                end
+                return current
+                """
+                current = await self._redis.eval(lua_script, 1, key, 60)
+                return int(current) > settings.RATE_LIMIT_PER_MINUTE
+            except Exception as e:
+                logger.warning(f"Redis rate limiting error ({e}). Falling back to in-memory.")
         
         # In-memory fallback rate limiter
         now = time.time()
